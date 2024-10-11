@@ -1,0 +1,21 @@
+---
+identity:
+  subject: https://gitlab.com/veshanka1/build-provenance-sbom-ver1//.gitlab-ci.yml@refs/heads/main
+  issuer: https://gitlab.com
+sources:
+
+  - policy:
+    - github.com/enterprise-contract/ec-policies//policy/lib
+    - github.com/enterprise-contract/ec-policies//policy/release
+    config:
+      include:
+        - sbom_cyclonedx.allowed
+        - sbom_cyclonedx.disallowed_packages_provided
+        - sbom_cyclonedx.found
+        - slsa_source_correlated
+    ruleData:
+      disallowed_packages:
+        - purl: pkg:golang/stdlib
+          format: semver
+          # 1.21 or lower is not allowed.
+          max: "1.22.1"

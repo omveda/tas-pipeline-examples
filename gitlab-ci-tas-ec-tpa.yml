@@ -1,0 +1,194 @@
+---
+stages:
+  - build
+  - secure
+  - promote
+
+variables:
+  APPS_DOMAIN: apps.xxxx.openshiftapps.com
+  TUF_URL: https://tuf-tas-test.apps.xxxx.openshiftapps.com
+  OIDC_ISSUER_URL: https://gitlab.com
+  COSIGN_FULCIO_URL: https://fulcio-server-tas-test.apps.xxxx.openshiftapps.com
+  COSIGN_REKOR_URL: https://rekor-server-tas-test.apps.xxxx.openshiftapps.com
+  COSIGN_MIRROR: https://tuf-tas-test.apps.xxxx.openshiftapps.com
+  COSIGN_ROOT: https://tuf-tas-test.apps.xxxx.openshiftapps.com/root.json
+  COSIGN_OIDC_ISSUER: https://gitlab.com
+  COSIGN_CERTIFICATE_OIDC_ISSUER: https://gitlab.com
+  SIGSTORE_FULCIO_URL: https://fulcio-server-tas-test.apps.xxxx.openshiftapps.com
+  SIGSTORE_REKOR_URL: https://rekor-server-tas-test.apps.xxxx.openshiftapps.com
+  REKOR_REKOR_SERVER: https://rekor-server-tas-test.apps.xxxx.openshiftapps.com
+  GITSIGN_OIDC_ISSUER: https://keycloak-keycloak-system.apps.xxxx.openshiftapps.com/auth/realms/sigstore
+
+code-signature-verify:
+  image:
+    name: quay.io/enterprise-contract/ec-cli:snapshot
+    entrypoint: [""]
+  stage: build
+  before_script:
+    - >
+      curl -Lks -o gitsign.gz 
+      https://cli-server-trusted-artifact-signer.$APPS_DOMAIN/clients/linux/gitsign-amd64.gz
+    - gzip -f -d gitsign.gz
+    - rm -f gitsign.gz
+    - chmod +x gitsign
+    - ./gitsign initialize --mirror=$TUF_URL --root=$TUF_URL/root.json
+  script:
+    - ./gitsign verify --certificate-identity=vedadashan@gmail.com --certificate-oidc-issuer=$GITSIGN_OIDC_ISSUER HEAD
+
+docker-build:
+  needs:
+    - job: code-signature-verify
+  # Use the official docker image.
+  image: docker:cli
+  stage: build
+  services:
+    - docker:dind
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  script:
+    - docker build --pull -t "$DOCKER_IMAGE_NAME" .
+    - docker push "$DOCKER_IMAGE_NAME"
+
+generate-sbom:
+  needs:
+    - job: docker-build
+  image:
+    name: quay.io/redhat-appstudio/syft:v0.105.1@sha256:1910b829997650c696881e5fc2fc654ddf3184c27edb1b2024e9cb2ba51ac431
+  stage: secure
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  script:
+    - syft "$DOCKER_IMAGE_NAME" -o cyclonedx-json@1.4=syft.cdx.json
+  artifacts:
+    paths:
+      - syft.cdx.json
+
+generate-provenance:
+  needs:
+    - job: generate-sbom
+  image: registry.access.redhat.com/ubi9:latest
+  stage: secure
+  script:
+    - ./scripts/generate.sh > predicate.json
+    - cat predicate.json
+  artifacts:
+    paths:
+      - predicate.json
+
+sign-and-attest:
+  needs:
+    - job: generate-provenance
+      artifacts: true
+    - job: generate-sbom
+      artifacts: true
+  image:
+    name: quay.io/enterprise-contract/ec-cli:snapshot
+    entrypoint: [""]
+  stage: secure
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    COSIGN_YES: "true"
+  # Set the JWT token audiance and the name of the env variable
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: "sigstore"
+  before_script:
+    - >
+      curl -Lks -o cosign.gz 
+      https://cli-server-trusted-artifact-signer.$APPS_DOMAIN/clients/linux/cosign-amd64.gz
+    - gzip -f -d cosign.gz
+    - rm -f cosign.gz
+    - chmod +x cosign
+    - ./cosign login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+    - ./cosign initialize
+  script:
+    - ./cosign sign ${DOCKER_IMAGE_NAME}
+    - ./cosign attest --predicate predicate.json --type https://slsa.dev/provenance/v1 ${DOCKER_IMAGE_NAME}
+    - ./cosign attest --predicate syft.cdx.json --type https://cyclonedx.org/bom ${DOCKER_IMAGE_NAME}
+
+slsa-ec-validate:
+  image:
+    name: quay.io/enterprise-contract/ec-cli:snapshot
+    entrypoint: [""]
+  stage: promote
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    GIT_REVISION: $CI_COMMIT_SHA
+  before_script:
+    - >
+      curl -Lks -o cosign.gz 
+      https://cli-server-trusted-artifact-signer.$APPS_DOMAIN/clients/linux/cosign-amd64.gz
+    - gzip -f -d cosign.gz
+    - rm -f cosign.gz
+    - chmod +x cosign
+    - ./cosign initialize
+
+  script:
+    - |
+      cat <<EOF | tee images.yaml
+      ---
+      components:
+        - containerImage: "${DOCKER_IMAGE_NAME}"
+          source:
+            git:
+              url: "${CI_PROJECT_URL}"
+              revision: "${GIT_REVISION}"
+      EOF
+    - cat images.yaml
+    - ec validate image --images images.yaml --policy policy.yaml --output yaml --show-successes
+
+tag-latest:
+  needs: [slsa-ec-validate]
+  image:
+    name: quay.io/enterprise-contract/ec-cli:snapshot
+    entrypoint: [""]
+  stage: promote
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  before_script:
+    - >
+      curl -Lks -o cosign.gz 
+      https://cli-server-trusted-artifact-signer.$APPS_DOMAIN/clients/linux/cosign-amd64.gz
+    - gzip -f -d cosign.gz
+    - rm -f cosign.gz
+    - chmod +x cosign
+    - ./cosign login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+  script:
+    - ./cosign copy -f "${DOCKER_IMAGE_NAME}" "$CI_REGISTRY_IMAGE:latest"
+
+upload-sbom:
+  needs:
+    - job: tag-latest
+    - job: generate-sbom
+      artifacts: true
+  image:
+    name: quay.io/enterprise-contract/ec-cli:snapshot
+    entrypoint: [""]
+  stage: promote
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  before_script:
+    - >
+      curl -s -k
+      -d "client_id=${BOMBASTIC_CLIENT_ID}"
+      -d "client_secret=${BOMBASTIC_CLIENT_SECRET}"
+      -d 'grant_type=client_credentials'
+      https://xxxxx.amazoncognito.com/oauth2/token |
+      jq -r .access_token >
+      bombastic-token
+  script:
+    - uuidgen | tee sbom_id
+    - >
+      SBOM_ID="$(cat sbom_id)" &&
+      TOKEN="$(cat bombastic-token)" &&
+      curl -s -k --oauth2-bearer "$TOKEN"
+      -H 'transfer-encoding: chunked'
+      -H 'Content-Type: application/json'
+      --data '@syft.cdx.json'
+      "https://sbom-tpa-demo.apps.<TPA server>/api/v1/sbom?id=${SBOM_ID}"
+    - echo "Uploaded SBOM with ID ${SBOM_ID}"
+  after_script:
+    - rm -f bombastic-token
+
